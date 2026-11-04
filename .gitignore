@@ -1,0 +1,38 @@
+# Local Python runtime and virtual environment
+/.python311-nuget/
+/.venv/
+
+# Local backups (preserved locally, not uploaded)
+/backup/
+
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+*$py.class
+/.matplotlib-cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# LFPS input data and generated outputs
+*.mseed
+*.miniseed
+*.png
+*.jpg
+*.jpeg
+*.xlsx
+*.xls
+*.csv
+*.log
+LFPS_Run_Log.json
+LFPS_Output/
+
+# Temporary files
+*.tmp
+~$*
