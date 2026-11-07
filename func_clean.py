@@ -3,6 +3,7 @@ from datetime import timedelta
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
+from obspy.signal.cross_correlation import correlate, xcorr_max
 from obspy.signal.trigger import classic_sta_lta
 from scipy.signal import savgol_filter as sgolay
 
@@ -20,10 +21,25 @@ def _reject_window(cfts, start, end, minimum, maximum, skip=None):
             or (skip is not None and skip[start:end].any()))
 
 
-def _smooth_savgol(data, preferred_window=201, polyorder=2):
-    """Haluskan data dengan window ganjil yang tidak melebihi panjang data."""
+def _smooth_savgol(data,preferred_window=21,polyorder=2,*,    
+    frequency_resolution=None,
+    smoothing_width_hz=None,):
+    """Haluskan data dengan Savitzky–Golay
+    Jika resolusi dan lebar smoothing diberikan, jumlah titik dihitung dalam
+    satuan Hz sehingga smoothing tetap konsisten untuk durasi FFT berbeda.
+    """
     data = np.asarray(data)
-    window = min(preferred_window, len(data))
+    if data.size == 0:
+        return data.copy()
+    if frequency_resolution is not None and smoothing_width_hz is not None:
+        if frequency_resolution <= 0 or smoothing_width_hz <= 0:
+            raise ValueError("Resolusi dan lebar smoothing harus lebih besar dari nol.")
+        preferred_window = max(
+            polyorder + 2,
+            int(round(smoothing_width_hz / frequency_resolution)),)
+    if preferred_window % 2 == 0:
+        preferred_window += 1
+    window = min(int(preferred_window), len(data))
     if window % 2 == 0:
         window -= 1
     if window <= polyorder:
@@ -56,6 +72,101 @@ def _power_spectrum(data, sampling_rate, window_type="boxcar"):
     if normalization <= 0:
         raise ValueError("Energi window spektral harus lebih besar dari nol.")
     return np.abs(np.fft.fft(data * window)) ** 2 / normalization
+
+
+def normalize_signal(data):
+    """Hilangkan mean dan normalisasi sinyal terhadap amplitudo absolut maksimum."""
+    values = np.asarray(data, dtype=np.float64)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("Data sinyal harus berupa array satu dimensi yang tidak kosong.")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Data sinyal mengandung NaN atau nilai tak hingga.")
+    values = values - np.mean(values)
+    scale = np.max(np.abs(values))
+    return values / scale if scale > 0 else values
+
+
+def compare_component_traces(trace_1, trace_2, max_lag_seconds):
+    """Hitung metrik perbandingan dua trace pada sampling rate yang sama.
+
+    Salinan trace diinterpolasi ke sampling rate terendah agar tidak mengubah
+    data masukan. Hasil menyertakan sinyal ternormalisasi untuk kebutuhan plot.
+    """
+    if max_lag_seconds < 0:
+        raise ValueError("Max lag tidak boleh negatif.")
+
+    first, second = trace_1.copy(), trace_2.copy()
+    sampling_rate = min(float(first.stats.sampling_rate), float(second.stats.sampling_rate))
+    if sampling_rate <= 0:
+        raise ValueError("Sampling rate harus lebih besar dari nol.")
+    if float(first.stats.sampling_rate) != sampling_rate:
+        first.interpolate(sampling_rate)
+    if float(second.stats.sampling_rate) != sampling_rate:
+        second.interpolate(sampling_rate)
+
+    sample_count = min(int(first.stats.npts), int(second.stats.npts))
+    if sample_count < 2:
+        raise ValueError("Sedikitnya dua sampel diperlukan untuk korelasi.")
+    raw_1 = np.asarray(first.data[:sample_count], dtype=np.float64)
+    raw_2 = np.asarray(second.data[:sample_count], dtype=np.float64)
+    normalized_1 = normalize_signal(raw_1)
+    normalized_2 = normalize_signal(raw_2)
+
+    max_lag_samples = min(int(max_lag_seconds * sampling_rate), sample_count - 1)
+    cross_correlation = correlate(
+        normalized_1, normalized_2, max_lag_samples, demean=False
+    )
+    shift_samples, coefficient = xcorr_max(cross_correlation, abs_max=False)
+
+    return {
+        "sampling_rate_hz": sampling_rate,
+        "sample_count": sample_count,
+        "shift_samples": int(shift_samples),
+        "lag_seconds": float(shift_samples / sampling_rate),
+        "correlation_max": float(coefficient),
+        "pearson_zero_lag": float(np.corrcoef(normalized_1, normalized_2)[0, 1]),
+        "rms_difference_raw": float(np.sqrt(np.mean((raw_1 - raw_2) ** 2))),
+        "rms_difference_normalized": float(
+            np.sqrt(np.mean((normalized_1 - normalized_2) ** 2))
+        ),
+        "normalized_1": normalized_1,
+        "normalized_2": normalized_2,
+        "time_seconds": np.arange(sample_count, dtype=float) / sampling_rate,
+    }
+
+
+def normalization_factor(reference_value, measured_value):
+    """Faktor pengali agar nilai pengukuran setara dengan nilai referensi."""
+    reference_value = float(reference_value)
+    measured_value = float(measured_value)
+    if not np.isfinite(reference_value) or not np.isfinite(measured_value):
+        return np.nan
+    return reference_value / measured_value if measured_value != 0 else np.nan
+
+
+def estimate_window_counts(duration, window_length, shift, accepted_percent):
+    """Perkirakan jumlah window total dan window yang lolos dari persentase kualitas."""
+    if duration <= window_length or shift <= 0:
+        return 0, 0
+    total = int(np.ceil((duration - window_length) / shift))
+    accepted = int(round((float(accepted_percent) / 100.0) * total))
+    return total, min(max(accepted, 0), total)
+
+
+def build_pair_matrix(names, records, value_key, *, diagonal=0.0, antisymmetric=False):
+    """Susun matriks pasangan simetris/antisimetris untuk heatmap perbandingan."""
+    labels = list(names)
+    positions = {name: index for index, name in enumerate(labels)}
+    matrix = np.full((len(labels), len(labels)), np.nan, dtype=float)
+    np.fill_diagonal(matrix, float(diagonal))
+    for record in records:
+        left, right = record["alat_1"], record["alat_2"]
+        if left not in positions or right not in positions:
+            continue
+        value = float(record[value_key])
+        matrix[positions[left], positions[right]] = value
+        matrix[positions[right], positions[left]] = -value if antisymmetric else value
+    return matrix
 
 
 def _polarization(z, n, e, mirror=False):
@@ -99,13 +210,54 @@ def convert_mirror_angle(math_degree):
         bearing-=360
     return bearing
 
-def preprocess(tr, detrend=True, bandpass=True, order=3, dspline=500, freqmin=0.5, freqmax=10):
-    for i in range(len(tr)):
-        tr[i].data = tr[i].data.astype('float64')
-        if detrend:
-            tr[i].detrend("spline", order=order, dspline=dspline)
+def preprocess(tr,detrend=True,bandpass=True,order=3,dspline=500,freqmin=0.5,freqmax=10,*,
+    detrend_method=None,spline_spacing_seconds=None,taper=False,taper_percentage=0.05,
+    zero_phase=True,):
+    """Preprocessing waveform yang konsisten untuk semua sampling rate."""
+    method = ("spline" if detrend else "none") if detrend_method is None else str(detrend_method)
+    method = method.strip().lower().replace(" + ", "_").replace("+", "_").replace(" ", "_")
+    aliases = {"constant": "demean", "demean_and_linear": "demean_linear"}
+    method = aliases.get(method, method)
+    valid_methods = {"none", "demean", "linear", "demean_linear", "spline"}
+    if method not in valid_methods:
+        raise ValueError(f"Metode detrend tidak dikenal: {detrend_method}.")
+    if method == "spline" and not 1 <= int(order) <= 5:
+        raise ValueError("Order spline harus berada dalam rentang 1 sampai 5.")
+    if spline_spacing_seconds is not None and float(spline_spacing_seconds) <= 0:
+        raise ValueError("Jarak node spline dalam detik harus lebih besar dari nol.")
+    if not 0 <= float(taper_percentage) <= 0.5:
+        raise ValueError("Persentase taper harus berada dalam rentang 0 sampai 0.5.")
+    if bandpass and not 0 < float(freqmin) < float(freqmax):
+        raise ValueError("Frekuensi bandpass harus memenuhi 0 < minimum < maksimum.")
+    for trace in tr:
+        trace.data = trace.data.astype("float64")
+        if method == "demean":
+            trace.detrend("demean")
+        elif method == "linear":
+            trace.detrend("linear")
+        elif method == "demean_linear":
+            trace.detrend("demean")
+            trace.detrend("linear")
+        elif method == "spline":
+            spacing_samples = (
+                int(round(float(spline_spacing_seconds) * trace.stats.sampling_rate))
+                if spline_spacing_seconds is not None else int(dspline)
+            )
+            if spacing_samples < 1:
+                raise ValueError("Jarak node spline menghasilkan kurang dari satu sampel.")
+            trace.detrend("spline", order=int(order), dspline=spacing_samples)
+
+    if taper and float(taper_percentage) > 0:
+        tr.taper(max_percentage=float(taper_percentage), type="cosine")
     if bandpass:
-        tr.filter("bandpass", freqmin=freqmin, freqmax=freqmax)
+        nyquist = min(float(trace.stats.sampling_rate) / 2.0 for trace in tr)
+        if float(freqmax) >= nyquist:
+            raise ValueError(
+                f"Frekuensi maksimum bandpass ({freqmax} Hz) harus di bawah Nyquist "
+                f"terendah ({nyquist:g} Hz).")
+        tr.filter(
+            "bandpass", freqmin=float(freqmin), freqmax=float(freqmax),
+            zerophase=bool(zero_phase))
     return tr
 
 
@@ -185,9 +337,8 @@ def calculateVH_STALTA_dip(trdat, windows, shift, savename, fmin=1, fmax=4, fmin
         fftE = _power_spectrum(trc.select(component='E')[0].data, samplingrate, spectral_window)
 
         VperH = np.sqrt((fftZ ** 2) / (fftN ** 2 + fftE ** 2))
-        VperH = _smooth_savgol(VperH)
+        VperH = _smooth_savgol(VperH,frequency_resolution=samplingrate / N,smoothing_width_hz=4.0)
 
-        
         freq = np.fft.fftfreq(N, 1 / samplingrate)
         VperH = VperH[:N // 2]
         freq = freq[:N // 2]
@@ -315,9 +466,13 @@ def _calculate_psd_dip(trdat, windows, shift, savename, fmin=1, fmax=4, fmin_plo
         fftE = _power_spectrum(trc.select(component='E')[0].data, samplingrate, spectral_window)
         fftZ, fftN, fftE = fftZ[:N // 2], fftN[:N // 2], fftE[:N // 2]
 
-        fftZlog = _smooth_savgol(10 * np.log10(fftZ) if logarithmic else fftZ)
-        fftNlog = _smooth_savgol(10 * np.log10(fftN) if logarithmic else fftN)
-        fftElog = _smooth_savgol(10 * np.log10(fftE) if logarithmic else fftE)
+        smoothing_options = {"frequency_resolution": samplingrate / N,"smoothing_width_hz": 1.0}
+        fftZlog = _smooth_savgol(
+            10 * np.log10(fftZ) if logarithmic else fftZ, **smoothing_options)
+        fftNlog = _smooth_savgol(
+            10 * np.log10(fftN) if logarithmic else fftN, **smoothing_options)
+        fftElog = _smooth_savgol(
+            10 * np.log10(fftE) if logarithmic else fftE, **smoothing_options)
 
         freq = np.fft.fftfreq(N, 1 / samplingrate)[:N // 2]
 
@@ -410,6 +565,10 @@ def _calculate_psd_dip(trdat, windows, shift, savename, fmin=1, fmax=4, fmin_plo
     axZ.text(x=finterp[Zinterp.argmax()], y=max(Zinterp),
             s="f: " + str(round(finterp[Zinterp.argmax()],5)) + "\nZmax: " + str(round(max(Zinterp),5))+ "\nIZ: "+ str(round(psd_iz,5)),
             bbox=dict(facecolor='blue', alpha=0.5), wrap=True)
+
+    # Plot integral PSD selalu dimulai dari nol agar autoscale tidak membuat
+    # ruang kosong yang terlalu jauh di bawah kurva (misalnya sampai -200).
+    axZ.set_ylim(bottom=0)
 
     figZ.savefig(savename + '_Zintegral' + suffix + '.png')
     plt.close(figZ)
@@ -566,6 +725,23 @@ def plot_window_dip(trdat, windows, shift, savename, fmin=1, fmax=4, fmin_plot=0
     ax_seisE = fig_seis.add_subplot(3, 1, 3)
     ax_seisE.plot(tr.select(component='E')[0].times("matplotlib"), tr.select(component='E')[0].data, 'k')
     ax_seisE.xaxis_date()
+
+    # Gunakan satu skala amplitudo simetris untuk Z, N, dan E agar besar
+    # amplitudo antar-komponen dapat dibandingkan langsung pada plot.
+    component_data = [
+        np.asarray(tr.select(component=component)[0].data, dtype=float)
+        for component in "ZNE"
+    ]
+    finite_amplitudes = [
+        np.max(np.abs(data[np.isfinite(data)]))
+        for data in component_data if np.any(np.isfinite(data))
+    ]
+    amplitude_limit = max(finite_amplitudes, default=0.0)
+    if amplitude_limit <= 0:
+        amplitude_limit = 1.0
+    amplitude_limit *= 1.05
+    for axis in (ax_seisZ, ax_seisN, ax_seisE):
+        axis.set_ylim(-amplitude_limit, amplitude_limit)
 
     iseg = 0
     t_start = max(tr[0].stats['starttime'], tr[1].stats['starttime'], tr[2].stats['starttime'])

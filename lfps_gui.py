@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import traceback
+import itertools
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -21,6 +22,7 @@ import matplotlib
 # worker thread dan tidak berkonflik dengan event loop Tkinter.
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
 from obspy import Stream, UTCDateTime, read
@@ -29,7 +31,11 @@ from func_clean import (
     calPSD_STALTA_dip,
     calPSD_STALTA_dip_nolog,
     cal_polar_dip,
+    build_pair_matrix,
+    compare_component_traces,
     calculateVH_STALTA_dip,
+    estimate_window_counts,
+    normalization_factor,
     plot_window_dip,
     preprocess,
 )
@@ -44,10 +50,13 @@ class LFPSParameters:
     trim_enabled: bool
     trim_start: str
     trim_end: str
-    detrend: bool
+    detrend_method: str
     bandpass: bool
     spline_order: int
-    dspline: int
+    spline_spacing_seconds: float
+    taper: bool
+    taper_percentage: float
+    zero_phase: bool
     preprocess_fmin: float
     preprocess_fmax: float
     window_length: float
@@ -89,8 +98,14 @@ class LFPSParameters:
             raise ValueError("Panjang window harus lebih besar dari 0.")
         if not 0 <= self.overlap < self.window_length:
             raise ValueError("Overlap harus >= 0 dan lebih kecil dari panjang window.")
-        if self.spline_order < 1 or self.dspline < 1:
-            raise ValueError("Order spline dan dspline harus berupa bilangan positif.")
+        if self.detrend_method not in {"none", "demean", "linear", "demean_linear", "spline"}:
+            raise ValueError("Metode detrend tidak valid.")
+        if self.detrend_method == "spline" and not 1 <= self.spline_order <= 5:
+            raise ValueError("Order spline harus berada di antara 1 dan 5.")
+        if self.detrend_method == "spline" and self.spline_spacing_seconds <= 0:
+            raise ValueError("Jarak node spline harus lebih besar dari nol detik.")
+        if not 0 <= self.taper_percentage <= 0.5:
+            raise ValueError("Persentase taper harus berada antara 0 dan 0.5.")
         if self.bandpass and not 0 < self.preprocess_fmin < self.preprocess_fmax:
             raise ValueError("Frekuensi bandpass harus memenuhi 0 < min < max.")
         if not 0 < self.analysis_fmin < self.analysis_fmax:
@@ -103,6 +118,95 @@ class LFPSParameters:
             raise ValueError("Ambang dip harus berada dalam rentang 0 sampai 90 derajat.")
         if self.spectral_window not in {"boxcar", "hann", "hamming", "blackman"}:
             raise ValueError("Window spektral harus boxcar, hann, hamming, atau blackman.")
+
+
+@dataclass(frozen=True)
+class CorrelationParameters:
+    input_folder: Path
+    output_folder: Path
+    recursive: bool
+    cut_enabled: bool
+    cut_start: str
+    cut_end: str
+    reference_name: str
+    min_overlap: float
+    max_lag: float
+    detrend_method: str
+    bandpass: bool
+    spline_order: int
+    spline_spacing_seconds: float
+    taper: bool
+    taper_percentage: float
+    zero_phase: bool
+    preprocess_fmin: float
+    preprocess_fmax: float
+    window_length: float
+    overlap: float
+    analysis_fmin: float
+    analysis_fmax: float
+    plot_fmin: float
+    plot_fmax: float
+    cft_min: float
+    cft_max: float
+    dip_threshold: float
+    spectral_window: str
+
+    @property
+    def shift(self) -> float:
+        return self.window_length - self.overlap
+
+    def validate(self) -> None:
+        if not self.input_folder.is_dir():
+            raise ValueError("Folder MiniSEED korelasi tidak ditemukan.")
+        if self.cut_enabled:
+            try:
+                start, end = UTCDateTime(self.cut_start), UTCDateTime(self.cut_end)
+            except Exception as exc:
+                raise ValueError("Format waktu cut korelasi tidak valid.") from exc
+            if end <= start:
+                raise ValueError("Endtime cut harus lebih besar dari starttime.")
+        if self.min_overlap <= 0 or self.max_lag < 0:
+            raise ValueError("Minimum overlap harus > 0 dan max lag harus >= 0.")
+        if self.window_length <= 0 or not 0 <= self.overlap < self.window_length:
+            raise ValueError("Window harus > 0 dan overlap harus lebih kecil dari window.")
+        if self.detrend_method not in {"none", "demean", "linear", "demean_linear", "spline"}:
+            raise ValueError("Metode detrend korelasi tidak valid.")
+        if self.detrend_method == "spline" and not 1 <= self.spline_order <= 5:
+            raise ValueError("Order spline harus berada di antara 1 dan 5.")
+        if self.detrend_method == "spline" and self.spline_spacing_seconds <= 0:
+            raise ValueError("Jarak node spline harus lebih besar dari nol detik.")
+        if not 0 <= self.taper_percentage <= 0.5:
+            raise ValueError("Persentase taper harus berada antara 0 dan 0.5.")
+        if self.bandpass and not 0 < self.preprocess_fmin < self.preprocess_fmax:
+            raise ValueError("Rentang bandpass korelasi tidak valid.")
+        if not 0 < self.analysis_fmin < self.analysis_fmax:
+            raise ValueError("Rentang frekuensi analisis korelasi tidak valid.")
+        if not 0 < self.plot_fmin < self.plot_fmax:
+            raise ValueError("Rentang frekuensi plot korelasi tidak valid.")
+        if self.cft_min >= self.cft_max or not 0 <= self.dip_threshold <= 90:
+            raise ValueError("CFT atau ambang dip korelasi tidak valid.")
+
+
+def correlation_attributes(params: CorrelationParameters) -> dict[str, object]:
+    return {
+        "recursive": params.recursive, "cut_enabled": params.cut_enabled,
+        "cut_start_utc": params.cut_start if params.cut_enabled else "",
+        "cut_end_utc": params.cut_end if params.cut_enabled else "",
+        "reference": params.reference_name or "otomatis (file pertama)",
+        "min_overlap_seconds": params.min_overlap, "max_lag_seconds": params.max_lag,
+        "detrend_method": params.detrend_method, "bandpass": params.bandpass,
+        "spline_order": params.spline_order,
+        "spline_spacing_seconds": params.spline_spacing_seconds,
+        "taper": params.taper, "taper_percentage": params.taper_percentage,
+        "zero_phase_bandpass": params.zero_phase,
+        "bandpass_min_hz": params.preprocess_fmin, "bandpass_max_hz": params.preprocess_fmax,
+        "window_seconds": params.window_length, "overlap_seconds": params.overlap,
+        "analysis_fmin_hz": params.analysis_fmin, "analysis_fmax_hz": params.analysis_fmax,
+        "plot_fmin_hz": params.plot_fmin, "plot_fmax_hz": params.plot_fmax,
+        "cft_min": params.cft_min, "cft_max": params.cft_max,
+        "dip_threshold_degree": params.dip_threshold,
+        "spectral_window": params.spectral_window,
+    }
 
 
 def find_mseed_files(folder: Path, recursive: bool) -> list[Path]:
@@ -140,10 +244,13 @@ def parameter_attributes(params: LFPSParameters) -> dict[str, object]:
         "Param Trim Enabled": params.trim_enabled,
         "Param Trim Start UTC": params.trim_start if params.trim_enabled else "",
         "Param Trim End UTC": params.trim_end if params.trim_enabled else "",
-        "Param Detrend": params.detrend,
+        "Param Detrend Method": params.detrend_method,
         "Param Bandpass": params.bandpass,
         "Param Spline Order": params.spline_order,
-        "Param Dspline": params.dspline,
+        "Param Spline Spacing (s)": params.spline_spacing_seconds,
+        "Param Taper": params.taper,
+        "Param Taper Percentage": params.taper_percentage,
+        "Param Zero Phase Bandpass": params.zero_phase,
         "Param Bandpass Min (Hz)": params.preprocess_fmin,
         "Param Bandpass Max (Hz)": params.preprocess_fmax,
         "Param Window Length (s)": params.window_length,
@@ -175,12 +282,15 @@ def analyse_file(source: Path, params: LFPSParameters) -> dict[str, object]:
     data = select_zne(read(str(source)))
     data = preprocess(
         data,
-        detrend=params.detrend,
         bandpass=params.bandpass,
         order=params.spline_order,
-        dspline=params.dspline,
         freqmin=params.preprocess_fmin,
         freqmax=params.preprocess_fmax,
+        detrend_method=params.detrend_method,
+        spline_spacing_seconds=params.spline_spacing_seconds,
+        taper=params.taper,
+        taper_percentage=params.taper_percentage,
+        zero_phase=params.zero_phase,
     )
 
     start_time = max(trace.stats.starttime for trace in data)
@@ -264,8 +374,9 @@ def analyse_file(source: Path, params: LFPSParameters) -> dict[str, object]:
     (rect, dip, azimuth, eigen), (rect_mean, dip_mean, azimuth_mean, eigen_mean) = polar
 
     # Fungsi LFPS memakai kondisi ``t1 < t_end - windows``.
-    total_window = int(np.ceil((duration - params.window_length) / params.shift))
-    accepted_window = int(round((quality_pct / 100.0) * total_window))
+    total_window, accepted_window = estimate_window_counts(
+        duration, params.window_length, params.shift, quality_pct
+    )
 
     return {
         "File": str(relative),
@@ -392,6 +503,215 @@ def process_batch(params: LFPSParameters, emit, cancelled) -> tuple[Path, int, i
     return summary_path, len(rows) - errors, errors
 
 
+def _safe_name(path: Path) -> str:
+    """Nama unik untuk output, termasuk nama subfolder bila mode rekursif."""
+    return "__".join(path.with_suffix("").parts).replace(" ", "_")
+
+
+def _plot_matrix(matrix: pd.DataFrame, title: str, label: str, path: Path,
+                 vmin=None, vmax=None, cmap="coolwarm") -> None:
+    fig, ax = plt.subplots(figsize=(max(8, len(matrix) * 0.8), max(6, len(matrix) * 0.7)))
+    image = ax.imshow(matrix.values, cmap=cmap, vmin=vmin, vmax=vmax)
+    fig.colorbar(image, ax=ax, label=label)
+    ax.set_xticks(range(len(matrix.columns)), matrix.columns, rotation=45, ha="right")
+    ax.set_yticks(range(len(matrix.index)), matrix.index)
+    for row in range(len(matrix.index)):
+        for column in range(len(matrix.columns)):
+            value = matrix.iat[row, column]
+            if np.isfinite(value):
+                ax.text(column, row, f"{value:.3g}", ha="center", va="center", fontsize=8)
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+
+def process_correlation(params: CorrelationParameters, emit, cancelled) -> tuple[Path, int, int]:
+    """Bandingkan waveform, PSD, dan V/H beberapa alat pada waktu yang sama."""
+    params.validate()
+    files = find_mseed_files(params.input_folder, params.recursive)
+    if len(files) < 2:
+        raise ValueError("Korelasi membutuhkan sedikitnya dua file MiniSEED.")
+
+    root = params.output_folder / "Correlation_Comparison"
+    pair_dir, heatmap_dir = root / "pair", root / "heatmap"
+    psd_dir, vh_dir = root / "psd", root / "vhsr"
+    for folder in (root, pair_dir, heatmap_dir, psd_dir, vh_dir):
+        folder.mkdir(parents=True, exist_ok=True)
+    log_path = root / "Correlation_Run_Log.json"
+    run_log: dict[str, object] = {
+        "started_at_utc": datetime.now(timezone.utc).isoformat(), "status": "running",
+        "input_folder": str(params.input_folder), "output_folder": str(root),
+        "parameters": correlation_attributes(params), "files": [], "errors": [],
+    }
+    write_run_log(log_path, run_log)
+    emit("corr_total", len(files) + (len(files) * (len(files) - 1) // 2) * 3)
+
+    loaded: list[dict[str, object]] = []
+    errors = 0
+    for index, source in enumerate(files, 1):
+        if cancelled():
+            break
+        emit("corr_log", f"[{index}/{len(files)}] Membaca {source.name}")
+        try:
+            stream = select_zne(read(str(source)))
+            stream = preprocess(
+                stream, bandpass=params.bandpass, order=params.spline_order,
+                freqmin=params.preprocess_fmin, freqmax=params.preprocess_fmax,
+                detrend_method=params.detrend_method,
+                spline_spacing_seconds=params.spline_spacing_seconds,
+                taper=params.taper, taper_percentage=params.taper_percentage,
+                zero_phase=params.zero_phase,
+            )
+            start = max(trace.stats.starttime for trace in stream)
+            end = min(trace.stats.endtime for trace in stream)
+            if params.cut_enabled:
+                start, end = max(start, UTCDateTime(params.cut_start)), min(end, UTCDateTime(params.cut_end))
+            if end <= start:
+                raise ValueError("Tidak beririsan dengan rentang cut.")
+            stream.trim(start, end)
+            relative = source.relative_to(params.input_folder)
+            loaded.append({"name": _safe_name(relative), "file": str(relative),
+                           "stream": stream, "start": start, "end": end})
+            run_log["files"].append({"file": str(relative), "start": str(start), "end": str(end)})
+        except Exception as exc:
+            errors += 1
+            message = f"{source.name}: {type(exc).__name__}: {exc}"
+            run_log["errors"].append(message)
+            emit("corr_log", f"  Gagal: {message}")
+        emit("corr_progress", index)
+        write_run_log(log_path, run_log)
+    if len(loaded) < 2:
+        raise ValueError("Kurang dari dua file berhasil dibaca untuk korelasi.")
+
+    requested_ref = params.reference_name.strip().lower()
+    reference = next((item for item in loaded if requested_ref and
+                      (requested_ref == str(item["name"]).lower() or
+                       requested_ref == Path(str(item["file"])).stem.lower())), loaded[0])
+    run_log["reference_used"] = reference["name"]
+
+    # Perbandingan bentuk spektrum dan faktor gain terhadap alat referensi.
+    spectra: list[dict[str, object]] = []
+    group_psd, ax_psd = plt.subplots(figsize=(12, 7))
+    group_vh, ax_vh = plt.subplots(figsize=(12, 7))
+    for item in loaded:
+        if cancelled():
+            break
+        try:
+            common = dict(cft_min=params.cft_min, cft_max=params.cft_max,
+                          dip_tres=params.dip_threshold, fmin=params.analysis_fmin,
+                          fmax=params.analysis_fmax, fmin_plot=params.plot_fmin,
+                          fmax_plot=params.plot_fmax, spectral_window=params.spectral_window)
+            psd = require_result("PSD", calPSD_STALTA_dip_nolog(
+                item["stream"], params.window_length, params.shift,
+                str(psd_dir / str(item["name"])), **common), 7)
+            vh = require_result("V/H", calculateVH_STALTA_dip(
+                item["stream"], params.window_length, params.shift,
+                str(vh_dir / str(item["name"])), **common), 6)
+            ax_psd.plot(psd[5], psd[6], label=item["name"])
+            ax_vh.plot(vh[4], vh[5], label=item["name"])
+            spectra.append({"name": item["name"], "psd_max": float(psd[0]),
+                            "psd_peak_hz": float(psd[1]), "psd_integral": float(psd[2]),
+                            "vh_max": float(vh[0]), "vh_peak_hz": float(vh[1])})
+        except Exception as exc:
+            errors += 1
+            message = f"Spektrum {item['name']}: {type(exc).__name__}: {exc}"
+            run_log["errors"].append(message)
+            emit("corr_log", f"  {message}")
+    for fig, ax, ylabel, filename in (
+        (group_psd, ax_psd, "PSD-Z", "GROUP_PSDZ.png"),
+        (group_vh, ax_vh, "V/H", "GROUP_VH.png")):
+        ax.set(xlabel="Frekuensi (Hz)", ylabel=ylabel); ax.grid(alpha=.3); ax.legend()
+        fig.tight_layout(); fig.savefig((psd_dir if "PSD" in filename else vh_dir) / filename, dpi=200)
+        plt.close(fig)
+    if spectra:
+        ref_spec = next((row for row in spectra if row["name"] == reference["name"]), spectra[0])
+        for row in spectra:
+            row["psd_gain_to_reference"] = normalization_factor(
+                ref_spec["psd_max"], row["psd_max"]
+            )
+            row["vh_gain_to_reference"] = normalization_factor(
+                ref_spec["vh_max"], row["vh_max"]
+            )
+        pd.DataFrame(spectra).to_csv(root / "REKAP_NORMALIZATION.csv", index=False)
+
+    rows: list[dict[str, object]] = []
+    pair_count = len(loaded) * (len(loaded) - 1) // 2
+    step = len(files)
+    for left, right in itertools.combinations(loaded, 2):
+        start, end = max(left["start"], right["start"]), min(left["end"], right["end"])
+        if end - start < params.min_overlap:
+            emit("corr_log", f"Lewati {left['name']} vs {right['name']}: overlap terlalu pendek")
+            step += 3; emit("corr_progress", step); continue
+        for component in "ZNE":
+            if cancelled():
+                break
+            try:
+                tr1 = left["stream"].select(component=component)[0].copy().trim(start, end)
+                tr2 = right["stream"].select(component=component)[0].copy().trim(start, end)
+                metrics = compare_component_traces(tr1, tr2, params.max_lag)
+                pair_name = f"{left['name']}_VS_{right['name']}_{component}"
+                figure_path = pair_dir / f"{pair_name}.png"
+                fig, ax = plt.subplots(figsize=(14, 4))
+                times = tr1.stats.starttime.matplotlib_date + metrics["time_seconds"] / 86400.0
+                ax.plot(times, metrics["normalized_1"] + 1.2, lw=.6, label=left["name"])
+                ax.plot(times, metrics["normalized_2"] - 1.2, lw=.6, label=right["name"])
+                ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+                ax.set_title(
+                    f"{component}: corr={metrics['correlation_max']:.4f}, "
+                    f"lag={metrics['lag_seconds']:.4f} s"
+                )
+                ax.set_xlabel("Waktu UTC"); ax.grid(alpha=.3); ax.legend(); fig.autofmt_xdate()
+                fig.tight_layout(); fig.savefig(figure_path, dpi=200); plt.close(fig)
+                rows.append({"component": component, "alat_1": left["name"],
+                             "alat_2": right["name"], "start_overlap": str(start),
+                             "end_overlap": str(end), "duration_seconds": float(end-start),
+                             "sampling_rate_hz": metrics["sampling_rate_hz"],
+                             "correlation_max": metrics["correlation_max"],
+                             "lag_seconds": metrics["lag_seconds"],
+                             "pearson_zero_lag": metrics["pearson_zero_lag"],
+                             "rms_difference_raw": metrics["rms_difference_raw"],
+                             "rms_difference_normalized": metrics["rms_difference_normalized"],
+                             "plot": str(figure_path)})
+            except Exception as exc:
+                errors += 1
+                run_log["errors"].append(f"{left['name']} vs {right['name']} {component}: {exc}")
+            step += 1; emit("corr_progress", step)
+    if not rows:
+        raise RuntimeError("Tidak ada pasangan dengan overlap yang cukup untuk dihitung.")
+
+    result = pd.DataFrame(rows)
+    csv_path = root / "REKAP_XCORR_FINAL.csv"
+    result.to_csv(csv_path, index=False)
+    names = [str(item["name"]) for item in loaded]
+    for component in "ZNE":
+        subset = result[result.component == component]
+        for column, title, label, limits in (
+            ("correlation_max", "Korelasi maksimum", "Koefisien", (-1, 1)),
+            ("lag_seconds", "Lag saat korelasi maksimum", "Lag (detik)", (None, None)),
+            ("rms_difference_normalized", "RMS selisih ternormalisasi", "RMS", (0, None))):
+            diagonal = 1.0 if column == "correlation_max" else 0.0
+            matrix = pd.DataFrame(
+                build_pair_matrix(
+                    names, subset.to_dict("records"), column, diagonal=diagonal,
+                    antisymmetric=column == "lag_seconds",
+                ),
+                index=names,
+                columns=names,
+            )
+            _plot_matrix(matrix, f"{title} - {component}", label,
+                         heatmap_dir / f"{component}_{column}.png", *limits)
+
+    run_log.update({"ended_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "status": "cancelled" if cancelled() else "completed_with_errors" if errors else "completed",
+                    "loaded_files": len(loaded), "pair_count": pair_count,
+                    "result_rows": len(rows), "result_csv": str(csv_path)})
+    write_run_log(log_path, run_log)
+    emit("corr_log", f"Referensi: {reference['name']}")
+    emit("corr_log", f"Hasil korelasi: {csv_path}")
+    return csv_path, len(rows), errors
+
+
 class LFPSApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -401,6 +721,8 @@ class LFPSApp(tk.Tk):
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.cancel_event = threading.Event()
         self.worker: threading.Thread | None = None
+        self.corr_cancel_event = threading.Event()
+        self.corr_worker: threading.Thread | None = None
         self.variables: dict[str, tk.Variable] = {}
         self._build_ui()
         self.after(100, self._poll_events)
@@ -411,8 +733,12 @@ class LFPSApp(tk.Tk):
         return variable
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self, padding=12)
-        outer.pack(fill="both", expand=True)
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True)
+        outer = ttk.Frame(notebook, padding=12)
+        corr_tab = ttk.Frame(notebook, padding=12)
+        notebook.add(outer, text="Proses LFPS")
+        notebook.add(corr_tab, text="Korelasi Antar Alat")
 
         folders = ttk.LabelFrame(outer, text="Input dan output", padding=10)
         folders.pack(fill="x")
@@ -486,7 +812,8 @@ class LFPSApp(tk.Tk):
             ("Bandpass min (Hz)", "preprocess_fmin", "1"),
             ("Bandpass max (Hz)", "preprocess_fmax", "10"),
             ("Order spline", "spline_order", "3"),
-            ("Dspline", "dspline", "500"),
+            ("Jarak node spline (detik)", "spline_spacing_seconds", "60"),
+            ("Taper maksimum (0-0.5)", "taper_percentage", "0.05"),
         ]
         for index, (label, name, default) in enumerate(defaults):
             row, pair = divmod(index, 2)
@@ -506,15 +833,30 @@ class LFPSApp(tk.Tk):
             state="readonly",
             width=13,
         ).grid(row=check_row, column=1, sticky="ew", padx=(0, 18), pady=3)
+        ttk.Label(parameters, text="Metode detrend").grid(
+            row=check_row, column=2, sticky="w", padx=(0, 6), pady=3
+        )
+        ttk.Combobox(
+            parameters,
+            textvariable=self._variable("detrend_method", "demean + linear"),
+            values=("none", "demean", "linear", "demean + linear", "spline"),
+            state="readonly",
+            width=16,
+        ).grid(row=check_row, column=3, sticky="ew", pady=3)
         ttk.Checkbutton(
             parameters,
-            text="Detrend spline",
-            variable=self._variable("detrend", True, tk.BooleanVar),
-        ).grid(row=check_row + 1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            text="Taper cosine",
+            variable=self._variable("taper", True, tk.BooleanVar),
+        ).grid(row=check_row + 1, column=0, sticky="w", pady=(6, 0))
         ttk.Checkbutton(
             parameters,
             text="Bandpass",
             variable=self._variable("bandpass", True, tk.BooleanVar),
+        ).grid(row=check_row + 1, column=1, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            parameters,
+            text="Zero-phase bandpass",
+            variable=self._variable("zero_phase", True, tk.BooleanVar),
         ).grid(row=check_row + 1, column=2, columnspan=2, sticky="w", pady=(6, 0))
         parameters.columnconfigure(1, weight=1)
         parameters.columnconfigure(3, weight=1)
@@ -540,6 +882,107 @@ class LFPSApp(tk.Tk):
         self.log.configure(yscrollcommand=scrollbar.set)
         self.log.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+        self._build_correlation_tab(corr_tab)
+
+    def _corr_variable(self, name: str, value, cls=tk.StringVar):
+        return self._variable("corr_" + name, value, cls)
+
+    def _build_correlation_tab(self, parent) -> None:
+        info = ttk.Label(
+            parent,
+            text=("Bandingkan rekaman beberapa alat yang mengukur di lokasi dan waktu yang sama. "
+                  "Output mencakup korelasi Z/N/E, lag, RMS, heatmap, PSD, V/H, dan faktor normalisasi."),
+            wraplength=850,
+        )
+        info.pack(fill="x", pady=(0, 8))
+        paths = ttk.LabelFrame(parent, text="Input dan output korelasi", padding=10)
+        paths.pack(fill="x")
+        for row, (label, name, command) in enumerate((
+            ("Folder MiniSEED", "input_folder", self._choose_corr_input),
+            ("Folder output", "output_folder", self._choose_corr_output),
+        )):
+            ttk.Label(paths, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
+            ttk.Entry(paths, textvariable=self._corr_variable(name, "")).grid(row=row, column=1, sticky="ew")
+            ttk.Button(paths, text="Pilih...", command=command).grid(row=row, column=2, padx=(8, 0))
+        ttk.Checkbutton(paths, text="Cari di subfolder",
+                        variable=self._corr_variable("recursive", False, tk.BooleanVar)).grid(
+                            row=2, column=1, sticky="w")
+        paths.columnconfigure(1, weight=1)
+
+        cut = ttk.LabelFrame(parent, text="Waktu pengukuran bersama (UTC)", padding=10)
+        cut.pack(fill="x", pady=(8, 0))
+        ttk.Checkbutton(cut, text="Gunakan cut waktu", variable=self._corr_variable(
+            "cut_enabled", True, tk.BooleanVar), command=self._toggle_corr_cut).grid(row=0, column=0, sticky="w")
+        ttk.Label(cut, text="Starttime").grid(row=1, column=0, sticky="w")
+        self.corr_start_entry = ttk.Entry(cut, textvariable=self._corr_variable("cut_start", ""))
+        self.corr_start_entry.grid(row=1, column=1, sticky="ew", padx=(6, 14))
+        ttk.Label(cut, text="Endtime").grid(row=1, column=2, sticky="w")
+        self.corr_end_entry = ttk.Entry(cut, textvariable=self._corr_variable("cut_end", ""))
+        self.corr_end_entry.grid(row=1, column=3, sticky="ew", padx=(6, 0))
+        cut.columnconfigure(1, weight=1); cut.columnconfigure(3, weight=1)
+
+        settings = ttk.LabelFrame(parent, text="Parameter perbandingan", padding=10)
+        settings.pack(fill="x", pady=(8, 0))
+        fields = [
+            ("Nama alat referensi (opsional)", "reference_name", ""),
+            ("Minimum overlap (detik)", "min_overlap", "30"),
+            ("Max lag (detik)", "max_lag", "30"),
+            ("Window LFPS (detik)", "window_length", "60"),
+            ("Overlap LFPS (detik)", "overlap", "30"),
+            ("Analisis fmin (Hz)", "analysis_fmin", "1"),
+            ("Analisis fmax (Hz)", "analysis_fmax", "6"),
+            ("Plot fmin (Hz)", "plot_fmin", "0.5"),
+            ("Plot fmax (Hz)", "plot_fmax", "10"),
+            ("CFT minimum", "cft_min", "0.5"), ("CFT maksimum", "cft_max", "2"),
+            ("Ambang dip", "dip_threshold", "0"),
+            ("Bandpass min (Hz)", "preprocess_fmin", "1"),
+            ("Bandpass max (Hz)", "preprocess_fmax", "10"),
+            ("Order spline", "spline_order", "3"),
+            ("Jarak node spline (detik)", "spline_spacing_seconds", "60"),
+            ("Taper maksimum (0-0.5)", "taper_percentage", "0.05"),
+        ]
+        for index, (label, name, default) in enumerate(fields):
+            row, pair = divmod(index, 2); column = pair * 2
+            ttk.Label(settings, text=label).grid(row=row, column=column, sticky="w", padx=(0, 6), pady=2)
+            ttk.Entry(settings, textvariable=self._corr_variable(name, default), width=16).grid(
+                row=row, column=column + 1, sticky="ew", padx=(0, 14), pady=2)
+        option_row = (len(fields) + 1) // 2
+        ttk.Label(settings, text="Window spektral").grid(row=option_row, column=0, sticky="w")
+        ttk.Combobox(settings, textvariable=self._corr_variable("spectral_window", "boxcar"),
+                     values=("boxcar", "hann", "hamming", "blackman"), state="readonly").grid(
+                         row=option_row, column=1, sticky="ew", padx=(0, 14))
+        ttk.Label(settings, text="Metode detrend").grid(row=option_row, column=2, sticky="w")
+        ttk.Combobox(
+            settings, textvariable=self._corr_variable("detrend_method", "demean + linear"),
+            values=("none", "demean", "linear", "demean + linear", "spline"), state="readonly"
+        ).grid(row=option_row, column=3, sticky="ew")
+        ttk.Checkbutton(settings, text="Taper cosine", variable=self._corr_variable(
+            "taper", True, tk.BooleanVar)).grid(row=option_row + 1, column=0, sticky="w")
+        ttk.Checkbutton(settings, text="Bandpass", variable=self._corr_variable(
+            "bandpass", True, tk.BooleanVar)).grid(row=option_row + 1, column=1, sticky="w")
+        ttk.Checkbutton(settings, text="Zero-phase bandpass", variable=self._corr_variable(
+            "zero_phase", True, tk.BooleanVar)).grid(row=option_row + 1, column=2,
+                                                       columnspan=2, sticky="w")
+        settings.columnconfigure(1, weight=1); settings.columnconfigure(3, weight=1)
+
+        controls = ttk.Frame(parent); controls.pack(fill="x", pady=(8, 0))
+        self.corr_start_button = ttk.Button(controls, text="Jalankan Korelasi", command=self._start_correlation)
+        self.corr_start_button.pack(side="left")
+        self.corr_cancel_button = ttk.Button(controls, text="Batalkan", command=self._cancel_correlation,
+                                             state="disabled")
+        self.corr_cancel_button.pack(side="left", padx=(8, 0))
+        ttk.Button(controls, text="Buka folder output", command=self._open_corr_output).pack(side="left", padx=(8, 0))
+        self.corr_status_var = tk.StringVar(value="Siap")
+        ttk.Label(controls, textvariable=self.corr_status_var).pack(side="right")
+        self.corr_progress = ttk.Progressbar(parent, mode="determinate")
+        self.corr_progress.pack(fill="x", pady=(8, 0))
+        log_frame = ttk.LabelFrame(parent, text="Log korelasi", padding=6)
+        log_frame.pack(fill="both", expand=True, pady=(8, 0))
+        self.corr_log = tk.Text(log_frame, height=8, wrap="word", state="disabled")
+        scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.corr_log.yview)
+        self.corr_log.configure(yscrollcommand=scroll.set)
+        self.corr_log.pack(side="left", fill="both", expand=True); scroll.pack(side="right", fill="y")
+        self._toggle_corr_cut()
 
     def _path_row(self, parent, row: int, label: str, name: str, command) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
@@ -631,10 +1074,13 @@ class LFPSApp(tk.Tk):
             trim_enabled=bool(self.variables["trim_enabled"].get()),
             trim_start=str(self.variables["trim_start"].get()).strip(),
             trim_end=str(self.variables["trim_end"].get()).strip(),
-            detrend=bool(self.variables["detrend"].get()),
+            detrend_method=str(self.variables["detrend_method"].get()).lower().replace(" + ", "_"),
             bandpass=bool(self.variables["bandpass"].get()),
             spline_order=int(number("spline_order")),
-            dspline=int(number("dspline")),
+            spline_spacing_seconds=number("spline_spacing_seconds"),
+            taper=bool(self.variables["taper"].get()),
+            taper_percentage=number("taper_percentage"),
+            zero_phase=bool(self.variables["zero_phase"].get()),
             preprocess_fmin=number("preprocess_fmin"),
             preprocess_fmax=number("preprocess_fmax"),
             window_length=number("window_length"),
@@ -650,6 +1096,9 @@ class LFPSApp(tk.Tk):
         )
 
     def _start(self) -> None:
+        if self.worker is not None or self.corr_worker is not None:
+            messagebox.showwarning("Proses aktif", "Tunggu proses lain selesai.", parent=self)
+            return
         try:
             params = self._parameters()
             params.validate()
@@ -684,6 +1133,104 @@ class LFPSApp(tk.Tk):
         self.cancel_button.configure(state="disabled")
         self.status_var.set("Membatalkan setelah file aktif selesai...")
 
+    def _choose_corr_input(self) -> None:
+        selected = filedialog.askdirectory(title="Pilih folder MiniSEED beberapa alat")
+        if selected:
+            self.variables["corr_input_folder"].set(selected)
+            if not self.variables["corr_output_folder"].get():
+                self.variables["corr_output_folder"].set(str(Path(selected) / "LFPS_Output"))
+            try:
+                files = find_mseed_files(Path(selected), bool(self.variables["corr_recursive"].get()))
+                starts, ends = [], []
+                for source in files:
+                    stream = select_zne(read(str(source), headonly=True))
+                    starts.append(max(trace.stats.starttime for trace in stream))
+                    ends.append(min(trace.stats.endtime for trace in stream))
+                if starts and ends and max(starts) < min(ends):
+                    self.variables["corr_cut_start"].set(str(max(starts)))
+                    self.variables["corr_cut_end"].set(str(min(ends)))
+                self._append_corr_log(f"Ditemukan {len(files)} file; waktu irisan bersama telah diisi.")
+            except Exception as exc:
+                self._append_corr_log(f"Waktu irisan otomatis tidak dapat dibaca: {exc}")
+
+    def _choose_corr_output(self) -> None:
+        selected = filedialog.askdirectory(title="Pilih folder output korelasi")
+        if selected:
+            self.variables["corr_output_folder"].set(selected)
+
+    def _toggle_corr_cut(self) -> None:
+        state = "normal" if self.variables["corr_cut_enabled"].get() else "disabled"
+        self.corr_start_entry.configure(state=state); self.corr_end_entry.configure(state=state)
+
+    def _correlation_parameters(self) -> CorrelationParameters:
+        def text(name: str) -> str:
+            return str(self.variables["corr_" + name].get()).strip()
+        def number(name: str) -> float:
+            try:
+                return float(text(name))
+            except ValueError as exc:
+                raise ValueError(f"Nilai {name} bukan angka valid.") from exc
+        if not text("input_folder") or not text("output_folder"):
+            raise ValueError("Folder input dan output korelasi harus dipilih.")
+        return CorrelationParameters(
+            input_folder=Path(text("input_folder")).expanduser().resolve(),
+            output_folder=Path(text("output_folder")).expanduser().resolve(),
+            recursive=bool(self.variables["corr_recursive"].get()),
+            cut_enabled=bool(self.variables["corr_cut_enabled"].get()),
+            cut_start=text("cut_start"), cut_end=text("cut_end"),
+            reference_name=text("reference_name"), min_overlap=number("min_overlap"),
+            max_lag=number("max_lag"),
+            detrend_method=text("detrend_method").lower().replace(" + ", "_"),
+            bandpass=bool(self.variables["corr_bandpass"].get()),
+            spline_order=int(number("spline_order")),
+            spline_spacing_seconds=number("spline_spacing_seconds"),
+            taper=bool(self.variables["corr_taper"].get()),
+            taper_percentage=number("taper_percentage"),
+            zero_phase=bool(self.variables["corr_zero_phase"].get()),
+            preprocess_fmin=number("preprocess_fmin"), preprocess_fmax=number("preprocess_fmax"),
+            window_length=number("window_length"), overlap=number("overlap"),
+            analysis_fmin=number("analysis_fmin"), analysis_fmax=number("analysis_fmax"),
+            plot_fmin=number("plot_fmin"), plot_fmax=number("plot_fmax"),
+            cft_min=number("cft_min"), cft_max=number("cft_max"),
+            dip_threshold=number("dip_threshold"), spectral_window=text("spectral_window").lower())
+
+    def _start_correlation(self) -> None:
+        if self.worker is not None or self.corr_worker is not None:
+            messagebox.showwarning("Proses aktif", "Tunggu proses lain selesai.", parent=self); return
+        try:
+            params = self._correlation_parameters(); params.validate()
+        except Exception as exc:
+            messagebox.showerror("Parameter tidak valid", str(exc), parent=self); return
+        self.corr_cancel_event.clear(); self.corr_progress.configure(value=0, maximum=1)
+        self.corr_start_button.configure(state="disabled"); self.corr_cancel_button.configure(state="normal")
+        self.corr_status_var.set("Memproses...")
+        self._append_corr_log(f"Input: {params.input_folder}")
+        self.corr_worker = threading.Thread(target=self._run_corr_worker, args=(params,), daemon=True)
+        self.corr_worker.start()
+
+    def _run_corr_worker(self, params: CorrelationParameters) -> None:
+        try:
+            result = process_correlation(params, lambda kind, value: self.events.put((kind, value)),
+                                         self.corr_cancel_event.is_set)
+            self.events.put(("corr_done", result))
+        except Exception as exc:
+            self.events.put(("corr_fatal", (exc, traceback.format_exc())))
+
+    def _cancel_correlation(self) -> None:
+        self.corr_cancel_event.set(); self.corr_cancel_button.configure(state="disabled")
+        self.corr_status_var.set("Membatalkan setelah tahap aktif selesai...")
+
+    def _append_corr_log(self, message: str) -> None:
+        self.corr_log.configure(state="normal"); self.corr_log.insert("end", message + "\n")
+        self.corr_log.see("end"); self.corr_log.configure(state="disabled")
+
+    def _open_corr_output(self) -> None:
+        raw = str(self.variables["corr_output_folder"].get()).strip()
+        folder = Path(raw) if raw else None
+        if folder is None or not folder.exists():
+            messagebox.showwarning("Folder output", "Folder output belum tersedia.", parent=self); return
+        os.startfile(folder)
+
     def _poll_events(self) -> None:
         try:
             while True:
@@ -710,6 +1257,28 @@ class LFPSApp(tk.Tk):
                     self.status_var.set("Gagal")
                     self._append_log(trace)
                     messagebox.showerror("LFPS gagal", str(exc), parent=self)
+                elif kind == "corr_log":
+                    self._append_corr_log(str(value))
+                elif kind == "corr_total":
+                    self.corr_progress.configure(maximum=int(value), value=0)
+                elif kind == "corr_progress":
+                    self.corr_progress.configure(value=int(value))
+                elif kind == "corr_done":
+                    path, rows, errors = value
+                    self.corr_start_button.configure(state="normal")
+                    self.corr_cancel_button.configure(state="disabled")
+                    self.corr_worker = None
+                    self.corr_status_var.set(f"Selesai: {rows} hasil, {errors} error")
+                    self._append_corr_log(f"Ringkasan disimpan: {path}")
+                    messagebox.showinfo("Korelasi selesai",
+                                        f"Hasil komponen/pasangan: {rows}\nError: {errors}\n\n{path}", parent=self)
+                elif kind == "corr_fatal":
+                    exc, trace = value
+                    self.corr_start_button.configure(state="normal")
+                    self.corr_cancel_button.configure(state="disabled")
+                    self.corr_worker = None; self.corr_status_var.set("Gagal")
+                    self._append_corr_log(trace)
+                    messagebox.showerror("Korelasi gagal", str(exc), parent=self)
         except queue.Empty:
             pass
         self.after(100, self._poll_events)
