@@ -10,6 +10,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 /.matplotlib-cache/
+/.build_pyinstaller/
+/release/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
