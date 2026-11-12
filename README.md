@@ -62,6 +62,7 @@ Jika sampling rate berbeda, kedua trace otomatis diinterpolasi ke sampling rate 
 
 ## Output LFPS
 Folder output utama berisi:
+"""
 LFPS_Output/
 ├── Hasil_Akhir_LFPS.xlsx
 ├── LFPS_Run_Log.json
@@ -71,7 +72,7 @@ LFPS_Output/
     ├── plot integral PSD-Z
     ├── plot V/H
     └── plot polarisasi
-
+"""
 Jika engine Excel tidak tersedia, rekap otomatis disimpan sebagai CSV.
 
 ## Output korelasi
