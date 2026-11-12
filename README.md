@@ -62,7 +62,7 @@ Jika sampling rate berbeda, kedua trace otomatis diinterpolasi ke sampling rate 
 
 ## Output LFPS
 Folder output utama berisi:
-"""text
+```text
 LFPS_Output/
 ├── Hasil_Akhir_LFPS.xlsx
 ├── LFPS_Run_Log.json
@@ -72,11 +72,13 @@ LFPS_Output/
     ├── plot integral PSD-Z
     ├── plot V/H
     └── plot polarisasi
-"""
+```
 
 Jika engine Excel tidak tersedia, rekap otomatis disimpan sebagai CSV.
 
 ## Output korelasi
+
+```text
 Correlation_Comparison/
 ├── pair/
 ├── heatmap/
@@ -85,7 +87,8 @@ Correlation_Comparison/
 ├── REKAP_XCORR_FINAL.csv
 ├── REKAP_NORMALIZATION.csv
 └── Correlation_Run_Log.json
+```
 
-##
-Masukan dan kontribusi dapat menghubungi di radityaambara@gmail.com
-##
+## Kontak dan kontribusi
+
+Masukan dan kontribusi dapat dikirimkan ke <radityaambara@gmail.com>.
